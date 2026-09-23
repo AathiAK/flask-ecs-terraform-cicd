@@ -1,0 +1,25 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# SSH Keys
+*.pem
+*.key
+
+README.md
+

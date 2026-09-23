@@ -1,0 +1,113 @@
+name: Deploy to ECS EC2
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: flask-demo
+  ECS_CLUSTER: flask-demo-cluster
+  ECS_SERVICE: flask-demo-service
+  CONTAINER_NAME: flask-app
+
+jobs:
+  deploy:
+    name: Build and Deploy to ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd docker
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition flask-demo --query taskDefinition > task-definition.json
+
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: false
+
+      - name: Wait for ECS to start task
+        run: sleep 40
+
+      - name: Get running task ARN
+        id: task
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --desired-status RUNNING \
+            --query 'taskArns[0]' \
+            --output text)
+
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Get container host port
+        id: port
+        run: |
+          PORT=$(aws ecs describe-tasks \
+            --cluster $ECS_CLUSTER \
+            --tasks ${{ steps.task.outputs.task_arn }} \
+            --query 'tasks[0].containers[0].networkBindings[0].hostPort' \
+            --output text)
+
+          echo "host_port=$PORT" >> $GITHUB_OUTPUT
+
+      - name: Get EC2 instance IP
+        id: ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=flask-demo-ecs-instance" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Test deployment
+        run: |
+          echo "Testing http://${{ steps.ip.outputs.ip }}:${{ steps.port.outputs.host_port }}/health"
+
+          curl -f --retry 12 --retry-delay 5 \
+            http://${{ steps.ip.outputs.ip }}:${{ steps.port.outputs.host_port }}/health
+
